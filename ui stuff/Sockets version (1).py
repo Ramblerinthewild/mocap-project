@@ -5,8 +5,8 @@ import numpy as np
 import time
 import socket
 from scipy.spatial.transform import Rotation
-from tkinter import Tk, Label, Button, Canvas, messagebox
-from threading import Thread
+from tkinter import Tk, Label, Button, Canvas
+from threading import Thread, Lock
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
@@ -17,6 +17,7 @@ HOST = '127.0.0.1'
 PORT = 12345
 sock = None
 blender_connected = False
+connection_lock = Lock()  # Lock for managing connection attempts
 
 # Initialize MediaPipe
 mp_pose = mp.solutions.pose
@@ -45,6 +46,7 @@ fig = None
 ax = None
 canvas = None
 
+
 def landmark_to_blender_coords(landmark):
     return [landmark.x, landmark.y, -landmark.z]
 
@@ -59,28 +61,45 @@ def calculate_quaternion(parent, child, bone_type="default"):
     direction = np.array(child_blender) - np.array(parent_blender)
     direction /= np.linalg.norm(direction)
 
-    if bone_type == "left_arm":
-        rest_direction = np.array([1, 0, 0])
-    elif bone_type == "right_arm":
-        rest_direction = np.array([-1, 0, 0])
-    elif bone_type == "spine":
-        rest_direction = np.array([0, -1, 0])
-    elif bone_type == "leg":
-        rest_direction = np.array([0, 1, 0])
-    elif bone_type == "right_shoulder":
-        rest_direction = np.array([-1, 0, 0])
-    elif bone_type == "left_shoulder":
-        rest_direction = np.array([1, 0, 0])
-    elif bone_type == "neck":
-        rest_direction = np.array([0, -1, 0])
-    else:
-        rest_direction = np.array([0, 0, 1])
+    rest_direction = {
+        "left_arm": np.array([1, 0, 0]),
+        "right_arm": np.array([-1, 0, 0]),
+        "spine": np.array([0, -1, 0]),
+        "leg": np.array([0, 1, 0]),
+        "right_shoulder": np.array([-1, 0, 0]),
+        "left_shoulder": np.array([1, 0, 0]),
+        "neck": np.array([0, -1, 0])
+    }.get(bone_type, np.array([0, 0, 1]))
+
     rot = Rotation.align_vectors([rest_direction], [direction])[0]
-    return rot.as_quat().tolist()  # [w, x, y, z]
+    return rot.as_quat().tolist()
+
+
+def manage_blender_connection():
+    """
+    Continuously manage the connection to Blender in a separate thread.
+    """
+    global blender_connected, sock
+
+    while running:
+        with connection_lock:
+            if not blender_connected:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.connect((HOST, PORT))
+                    blender_connected = True
+                    connection_label.config(text="Connected to Blender", fg="green")
+                except Exception as e:
+                    blender_connected = False
+                    connection_label.config(text="Waiting for Blender connection...", fg="red")
+        time.sleep(3)  # Retry every 3 seconds
 
 
 def pose_estimator():
-    global cap, running, blender_connected, sock, landmarks_3d
+    """
+    Processes the live video feed and updates the Tkinter video frame.
+    """
+    global cap, running, landmarks_3d
 
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -95,7 +114,7 @@ def pose_estimator():
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = pose.process(image_rgb)
 
-        # Draw landmarks
+        # Draw landmarks on live video feed
         if results.pose_landmarks:
             mp_drawing.draw_landmarks(
                 frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
@@ -106,28 +125,19 @@ def pose_estimator():
         # Extract 3D landmarks for stick figure
         if results.pose_world_landmarks:
             landmarks_3d = [
-                (lm.x, lm.y, lm.z) for lm in results.pose_world_landmarks.landmark
+                (lm.x, -lm.z, -lm.y) for lm in results.pose_world_landmarks.landmark
             ]
 
-        # Update the live video feed in Tkinter
+        # Update the live video in Tkinter
         image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(image)
         image = ImageTk.PhotoImage(image)
         video_label.config(image=image)
         video_label.image = image
 
-        # Check for Blender connection
-        if results.pose_world_landmarks:
-            if not blender_connected:
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.connect((HOST, PORT))
-                    blender_connected = True
-                    connection_label.config(text="Connected to Blender", fg="green")
-                except Exception as e:
-                    connection_label.config(text="Waiting for Blender connection...", fg="red")
-
-            if blender_connected:
+        # Send pose data to Blender
+        if blender_connected and results.pose_world_landmarks:
+            try:
                 landmarks = results.pose_world_landmarks.landmark
                 mid_shoulders = midpoint(landmarks[11], landmarks[12])
                 mid_hips = midpoint(landmarks[23], landmarks[24])
@@ -169,9 +179,14 @@ def pose_estimator():
                 }
 
                 sock.sendall((json.dumps(data) + "\n").encode('utf-8'))
+            except Exception as e:
+                print(f"Error sending data to Blender: {e}")
 
 
 def update_3d_pose():
+    """
+    Updates the 3D stick figure visualization with landmarks and connections.
+    """
     global running, landmarks_3d
 
     while running:
@@ -182,13 +197,12 @@ def update_3d_pose():
             ax.set_ylim([-1, 1])
             ax.set_zlim([-1, 1])
 
-            # Plot the landmarks
+            # Plot the transformed landmarks
             x_vals = [lm[0] for lm in landmarks_3d]
             y_vals = [lm[1] for lm in landmarks_3d]
             z_vals = [lm[2] for lm in landmarks_3d]
             ax.scatter(x_vals, y_vals, z_vals, c='r', marker='o')
 
-            # Draw connections
             for connection in connections:
                 start, end = connection
                 ax.plot(
@@ -206,6 +220,7 @@ def start_pose_estimation():
     running = True
     Thread(target=pose_estimator, daemon=True).start()
     Thread(target=update_3d_pose, daemon=True).start()
+    Thread(target=manage_blender_connection, daemon=True).start()
 
 
 def stop_pose_estimation():
