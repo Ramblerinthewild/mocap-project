@@ -79,12 +79,7 @@ try:
 
 
             data = {
-                "mixamorig:Hips": {
-                    "position": [  # Wrap in a "position" key
-                        mid_hips.x,  # X
-                        mid_hips.y,  # Y (up)
-                        mid_hips.z   # Z
-            ]},
+
                 "mixamorig:LeftShoulder":{
                     "rotation": calculate_quaternion(mid_shoulders, landmarks[11], "left_shoulder")
             },
